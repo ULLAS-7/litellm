@@ -5,6 +5,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { useTranslation } from "react-i18next";
 import CustomerAllowedModelsSelect from "../../customers/_components/CustomerAllowedModelsSelect";
+import { CustomerRateLimitFields } from "../../customers/_components/CustomerRateLimits";
 import type { AppBudgetFields } from "./appForms";
 
 export default function AppBudgetEditor({
@@ -26,8 +27,6 @@ export default function AppBudgetEditor({
   const numericFields = [
     ["maxBudget", "customerPortal.hierarchy.maxBudget", 0.01],
     ["softBudget", "customerPortal.hierarchy.softBudget", 0.01],
-    ["tpm", "customerPortal.hierarchy.tpm", 1],
-    ["rpm", "customerPortal.hierarchy.rpm", 1],
   ] as const;
   return (
     <fieldset className="min-w-0 space-y-4 border-t pt-4">
@@ -108,6 +107,7 @@ export default function AppBudgetEditor({
               </p>
             </div>
           </div>
+          <CustomerRateLimitFields id={id} tpm={fields.tpm} rpm={fields.rpm} onChange={update} />
           <div className="space-y-1.5">
             <label htmlFor={`${id}-models`} className="block text-sm">
               {t("customerPortal.hierarchy.allowedModels")}

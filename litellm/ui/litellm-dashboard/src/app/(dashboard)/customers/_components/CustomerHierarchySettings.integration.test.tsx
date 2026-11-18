@@ -91,6 +91,27 @@ describe("CustomerHierarchySettings", () => {
     vi.unstubAllGlobals();
   });
 
+  it("sets organization rate limits without requiring a dollar budget", async () => {
+    const unlimited = { ...organization, budget: null };
+    fetchMock.mockResolvedValue(json(unlimited));
+    render(
+      <CustomerHierarchySettings
+        entity={{ kind: "organization", record: unlimited }}
+        organization={unlimited}
+        onSaved={onSaved}
+        onDeleted={onDeleted}
+      />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: "Set custom limits" }));
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Tokens per minute" }), { target: { value: "50000" } });
+    fireEvent.change(screen.getByRole("spinbutton", { name: "Requests per minute" }), { target: { value: "60" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledOnce());
+    expect(await lastRequest().clone().json()).toMatchObject({
+      budget: { max_budget: null, tpm_limit: 50000, rpm_limit: 60 },
+    });
+  });
+
   it("should render the existing organization settings and read-only identifier", () => {
     render(
       <CustomerHierarchySettings
@@ -129,7 +150,7 @@ describe("CustomerHierarchySettings", () => {
     expect(await lastRequest().clone().json()).toEqual({ budget: { ...custom.budget, max_budget: 0 } });
   });
 
-  it.each(["$175", ""])("replaces a group with custom budget %s", async (amount) => {
+  it.each(["$175", ""])("replaces a group with custom spend %s while keeping rate limits", async (amount) => {
     const user = userEvent.setup();
     const grouped = { ...organization, budget_id: "shared" };
     fetchMock.mockImplementation(async () => json(grouped));
@@ -149,7 +170,7 @@ describe("CustomerHierarchySettings", () => {
     await user.click(save);
     await waitFor(() => expect(onSaved).toHaveBeenCalledOnce());
     expect(await lastRequest().clone().json()).toEqual({
-      budget: amount ? { ...organization.budget, max_budget: 175, budget_limits: null } : null,
+      budget: { ...organization.budget, max_budget: amount ? 175 : null, budget_limits: null },
     });
   });
 

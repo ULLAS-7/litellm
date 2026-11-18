@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import type { CustomerHierarchyFields, CustomerHierarchyEntity, Organization } from "./customerHierarchyForms";
 import CustomerAllowedModelsSelect from "./CustomerAllowedModelsSelect";
 import CustomerBudgetInput from "./CustomerBudgetInput";
+import { CustomerRateLimitFields, CustomerRateLimitSummary } from "./CustomerRateLimits";
 
 interface Props {
   kind: CustomerHierarchyEntity["kind"];
@@ -37,6 +38,7 @@ export default function CustomerHierarchyBudgetFields({
   const usingGroup =
     kind === "organization" && groups.data?.default_budgets.some((group) => group.budget_id === fields.templateId);
   const budgetReady = kind !== "organization" || Boolean(groups.data);
+  const showCustomBudget = budgetReady && !usingGroup;
   const monthly = organization.budget?.budget_limits?.some((window) => window.budget_duration === "1mo");
   const newScalarBudget = organization.budget?.max_budget == null && !monthly;
   const updateBudget = (budgetId: string, amount: string) => {
@@ -45,7 +47,10 @@ export default function CustomerHierarchyBudgetFields({
     update("templateId", budgetId);
     update("maxBudget", amount);
     if (usingGroup || newScalarBudget) update("budgetDuration", "1mo");
-    update("budgetEnabled", Boolean(budgetId || amount.trim()));
+    update(
+      "budgetEnabled",
+      [budgetId, amount, fields.tpm, fields.rpm].some((value) => value.trim()),
+    );
   };
   const templateLabel = (templateId: string): string => {
     if (!templateId) return t("customerPortal.hierarchy.noTemplate");
@@ -58,8 +63,6 @@ export default function CustomerHierarchyBudgetFields({
   const numericFields = [
     ["maxBudget", "customerPortal.hierarchy.maxBudget", "any"],
     ["softBudget", "customerPortal.hierarchy.softBudget", "any"],
-    ["tpm", "customerPortal.hierarchy.tpm", "1"],
-    ["rpm", "customerPortal.hierarchy.rpm", "1"],
   ] as const;
   return (
     <section className="space-y-4 border-t pt-6" aria-labelledby={`${idPrefix}-budget-title`}>
@@ -102,7 +105,12 @@ export default function CustomerHierarchyBudgetFields({
           </Select>
         </div>
       )}
-      <div hidden={kind === "organization"} className="space-y-1.5">
+      {kind === "member" && (
+        <CustomerRateLimitSummary
+          limits={organization.default_budgets.find((group) => group.budget_id === fields.templateId)}
+        />
+      )}
+      <div hidden={!showCustomBudget} className="space-y-1.5">
         <div className="flex items-center gap-2">
           <Checkbox
             id={`${idPrefix}-budget-enabled`}
@@ -116,7 +124,7 @@ export default function CustomerHierarchyBudgetFields({
           </Label>
         </div>
       </div>
-      {budgetReady && !usingGroup && fields.budgetEnabled && (
+      {showCustomBudget && fields.budgetEnabled && (
         <div className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             {numericFields.map(([name, label, step]) => (
@@ -160,6 +168,7 @@ export default function CustomerHierarchyBudgetFields({
               </div>
             )}
           </div>
+          <CustomerRateLimitFields id={idPrefix} tpm={fields.tpm} rpm={fields.rpm} onChange={update} />
           <div className="space-y-1.5">
             <Label htmlFor={`${idPrefix}-models`}>{t("customerPortal.hierarchy.allowedModels")}</Label>
             <CustomerAllowedModelsSelect
