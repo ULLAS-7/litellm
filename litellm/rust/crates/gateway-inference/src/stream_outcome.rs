@@ -2,8 +2,12 @@
 //! served deferred: the router counted its request and hears the rest here, a success with the
 //! tokens the stream counted once it ends, or a failure the moment the stream breaks or carries
 //! the provider's error. A stream the client stops reading reports neither.
+//!
+//! A provider's error event is the failure the same error is before a stream opens, with the
+//! same status, so the cooldown rules read both alike. The Python proxy differs: it records a
+//! stream that goes out with an error event as served, unless another attempt took it over.
 
-use std::future::Future;
+use std::{future::Future, sync::Arc};
 
 use bytes::Bytes;
 use futures_util::{
@@ -13,15 +17,20 @@ use futures_util::{
 use litellm_framer::sse::{self, SseBlock};
 use litellm_host::{call::CallOutput, protocol::Protocol};
 use litellm_inference::Error as InferenceError;
-use litellm_llms_types::formats::responses::streaming::ResponsesEventType;
-use litellm_router_core::{AttemptError, Deployment, FailureKind, FailureReport, SuccessReport};
+use litellm_llms_types::formats::{
+    messages::streaming::{MessagesStreamEvent, MessagesStreamUsage},
+    responses::streaming::ResponsesEventType,
+};
+use litellm_router_core::{
+    AttemptError, Deployment, FailureKind, FailureReport, Router, RouterCache, SuccessReport,
+};
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use crate::{Gateway, routing};
+use crate::{Gateway, error::anthropic_error_status, routing};
 
-/// The status litellm gives a provider's error event, which arrives after a 200.
-const ERROR_EVENT_STATUS: u16 = 500;
+/// The status of a Responses error event, which names none.
+const RESPONSES_ERROR_STATUS: u16 = 500;
 
 /// What a hosted call ran to, a stream of it as the blocks it was read in.
 pub(crate) type Streamed<P> = CallOutput<
@@ -45,34 +54,65 @@ pub(crate) fn bytes<R, H, E: 'static>(
     }
 }
 
+/// The tokens an event's `usage` counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize)]
+struct Counts {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+impl Counts {
+    fn over(self, earlier: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.or(earlier.input_tokens),
+            output_tokens: self.output_tokens.or(earlier.output_tokens),
+            total_tokens: self.total_tokens.or(earlier.total_tokens),
+        }
+    }
+
+    /// `total_tokens`, else the input plus the output, as [`routing::total_tokens`] counts a
+    /// complete response.
+    fn total(self) -> u64 {
+        self.total_tokens
+            .unwrap_or_else(|| self.input_tokens.unwrap_or(0) + self.output_tokens.unwrap_or(0))
+    }
+}
+
+impl From<MessagesStreamUsage> for Counts {
+    fn from(usage: MessagesStreamUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: None,
+        }
+    }
+}
+
 /// What a stream's own events said so far.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Told {
-    /// The usage the events carried, a later event's counts over an earlier one's.
-    usage: Map<String, Value>,
-    /// The provider's error event, as it was sent.
-    error: Option<String>,
+    /// The tokens the events counted, a later event's count over an earlier one's.
+    counts: Counts,
+    /// The provider's error event: the status the same error has before a stream, and the event
+    /// as it was sent.
+    error: Option<(u16, String)>,
 }
 
 impl Told {
-    fn with_usage(self, usage: Value) -> Self {
-        let Value::Object(counts) = usage else {
+    fn counting(self, usage: Option<impl Into<Counts>>) -> Self {
+        let Some(usage) = usage else {
             return self;
         };
         Self {
-            usage: self
-                .usage
-                .into_iter()
-                .chain(counts)
-                .filter(|(_, count)| !count.is_null())
-                .collect(),
+            counts: usage.into().over(self.counts),
             ..self
         }
     }
 
-    fn with_error(self, sent: &str) -> Self {
+    fn with_error(self, status: u16, sent: &str) -> Self {
         Self {
-            error: Some(sent.to_owned()),
+            error: Some((status, sent.to_owned())),
             ..self
         }
     }
@@ -81,38 +121,32 @@ impl Told {
 /// Reads the data of one event of a protocol's stream into what the stream said so far.
 pub(crate) type Read = fn(Told, &str) -> Told;
 
-/// The part of an event that carries its counts.
-#[derive(Default, Deserialize)]
-struct Counted {
-    #[serde(default)]
-    usage: Value,
-}
-
 /// An Anthropic Messages event: `message_start` counts the input, `message_delta` the output.
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum MessagesEvent {
-    MessageStart {
-        #[serde(default)]
-        message: Counted,
-    },
-    MessageDelta(Counted),
-    MessageStop(Counted),
-    Error,
-    #[serde(other)]
-    Other,
-}
-
 pub(crate) fn messages_event(told: Told, data: &str) -> Told {
     match serde_json::from_str(data) {
+        Ok(MessagesStreamEvent::MessageStart { message }) => told.counting(message.usage),
         Ok(
-            MessagesEvent::MessageStart { message: counted }
-            | MessagesEvent::MessageDelta(counted)
-            | MessagesEvent::MessageStop(counted),
-        ) => told.with_usage(counted.usage),
-        Ok(MessagesEvent::Error) => told.with_error(data),
-        Ok(MessagesEvent::Other) | Err(_) => told,
+            MessagesStreamEvent::MessageDelta { usage, .. }
+            | MessagesStreamEvent::MessageStop { usage, .. },
+        ) => told.counting(usage),
+        Ok(MessagesStreamEvent::Error { error }) => {
+            told.with_error(anthropic_error_status(&error.error_type), data)
+        }
+        Ok(
+            MessagesStreamEvent::ContentBlockStart { .. }
+            | MessagesStreamEvent::ContentBlockDelta { .. }
+            | MessagesStreamEvent::ContentBlockStop { .. }
+            | MessagesStreamEvent::Ping
+            | MessagesStreamEvent::Other(_),
+        )
+        | Err(_) => told,
     }
+}
+
+/// The part of a Responses event that carries its counts.
+#[derive(Default, Deserialize)]
+struct Counted {
+    usage: Option<Counts>,
 }
 
 /// An OpenAI Responses event: the closing event carries the response and its usage.
@@ -129,9 +163,11 @@ pub(crate) fn responses_event(told: Told, data: &str) -> Told {
     };
     match event.kind {
         ResponsesEventType::ResponseCompleted | ResponsesEventType::ResponseIncomplete => {
-            told.with_usage(event.response.unwrap_or_default().usage)
+            told.counting(event.response.unwrap_or_default().usage)
         }
-        ResponsesEventType::ResponseFailed | ResponsesEventType::Error => told.with_error(data),
+        ResponsesEventType::ResponseFailed | ResponsesEventType::Error => {
+            told.with_error(RESPONSES_ERROR_STATUS, data)
+        }
         _ => told,
     }
 }
@@ -187,22 +223,15 @@ where
                     None => told,
                 };
                 match &told.error {
-                    Some(sent) => (
+                    Some((status, sent)) => (
                         None,
-                        Some(Err(AttemptError::from_provider(
-                            ERROR_EVENT_STATUS,
-                            sent,
-                            None,
-                        ))),
+                        Some(Err(AttemptError::from_provider(*status, sent, None))),
                     ),
                     None => (Some(told), None),
                 }
             }
             (Some(Err(error)), Some(_)) => (None, Some(Err(broke(error)))),
-            (None, Some(told)) => {
-                let usage = Value::Object(told.usage);
-                (None, Some(Ok(routing::total_tokens(Some(&usage)))))
-            }
+            (None, Some(told)) => (None, Some(Ok(told.counts.total()))),
         };
         if let Some(outcome) = outcome {
             report(outcome).await;
@@ -212,58 +241,70 @@ where
     .boxed()
 }
 
-/// `chunks` of a stream `deployment` serves, as the blocks they carry, the stream's outcome
-/// reported to the router.
-pub(crate) fn reporting_outcome<H: routing::Host>(
-    gateway: &Gateway<H>,
+/// A stream's failure after its attempt returned it, recorded against `deployment` as Python's
+/// `report_stream_failure` records it: counted, and cooled down by the rules for the
+/// deployment's own `cooldown_time`.
+async fn record_failure<C: RouterCache>(
+    router: &Router,
+    cache: &C,
     deployment: &Deployment,
-    chunks: BoxStream<'static, Result<Bytes, litellm_host_http::Error<InferenceError>>>,
-    read: Read,
-) -> BoxStream<'static, Result<SseBlock, litellm_host_http::Error<InferenceError>>> {
-    let router = gateway.router.clone();
-    let routing = gateway.routing.clone();
-    let deployment_id = deployment.id.clone();
+    failure: &AttemptError,
+) {
     let cooldown_time = deployment.model_info.cooldown_time.or_else(|| {
         deployment
             .raw_params
             .get("cooldown_time")
             .and_then(Value::as_f64)
     });
+    let report = FailureReport {
+        deployment_cooldown: true,
+        cooldown_time,
+        ..FailureReport::default()
+    };
+    if let Err(error) = router
+        .report_failure(cache, &deployment.id, failure, report)
+        .await
+    {
+        tracing::warn!(deployment_id = %deployment.id, %error, "stream failure was not recorded");
+    }
+}
+
+/// `chunks` of a stream `deployment` serves, as the blocks they carry, the stream's outcome
+/// reported to the router.
+pub(crate) fn reporting_outcome<H: routing::Host>(
+    gateway: &Gateway<H>,
+    deployment: &Arc<Deployment>,
+    chunks: BoxStream<'static, Result<Bytes, litellm_host_http::Error<InferenceError>>>,
+    read: Read,
+) -> BoxStream<'static, Result<SseBlock, litellm_host_http::Error<InferenceError>>> {
+    let router = gateway.router.clone();
+    let routing = gateway.routing.clone();
+    let deployment = deployment.clone();
     watched(
         sse::blocks(chunks).boxed(),
         read,
         broke,
         move |outcome: Outcome| {
-            let (router, routing, deployment_id) =
-                (router.clone(), routing.clone(), deployment_id.clone());
+            let (router, routing, deployment) =
+                (router.clone(), routing.clone(), deployment.clone());
             async move {
-                let recorded = match outcome {
-                    Ok(total_tokens) => router
-                        .report_success(
-                            &*routing,
-                            &deployment_id,
-                            total_tokens as f64,
-                            0.0,
-                            SuccessReport::default(),
-                        )
-                        .await
-                        .map(|_| ()),
-                    Err(failure) => router
-                        .report_failure(
-                            &*routing,
-                            &deployment_id,
-                            &failure,
-                            FailureReport {
-                                deployment_cooldown: true,
-                                cooldown_time,
-                                ..FailureReport::default()
-                            },
-                        )
-                        .await
-                        .map(|_| ()),
+                let total_tokens = match outcome {
+                    Ok(total_tokens) => total_tokens,
+                    Err(failure) => {
+                        return record_failure(&router, &*routing, &deployment, &failure).await;
+                    }
                 };
+                let recorded = router
+                    .report_success(
+                        &*routing,
+                        &deployment.id,
+                        total_tokens as f64,
+                        0.0,
+                        SuccessReport::default(),
+                    )
+                    .await;
                 if let Err(error) = recorded {
-                    tracing::warn!(%deployment_id, %error, "stream outcome was not recorded");
+                    tracing::warn!(deployment_id = %deployment.id, %error, "stream outcome was not recorded");
                 }
             }
         },
@@ -331,10 +372,10 @@ mod tests {
         vec![Ok(9)]
     )]
     #[case::a_stream_without_usage_counts_nothing(vec![Ok(STOP)], messages_event as Read, vec![Ok(0)])]
-    #[case::messages_error_event_fails_once(
+    #[case::an_overloaded_messages_provider_fails_once_as_its_529(
         vec![Ok(START), Ok(OVERLOADED), Ok(STOP)],
         messages_event as Read,
-        vec![Err((Some(500), FailureKind::InternalServer))]
+        vec![Err((Some(529), FailureKind::InternalServer))]
     )]
     #[case::responses_failed_event_fails(
         vec![Ok(FAILED)],
@@ -355,6 +396,29 @@ mod tests {
         let sent = chunks.len();
 
         assert_eq!(heard(chunks, read, usize::MAX).await, (sent, expected));
+    }
+
+    /// A provider's stream goes out as it was sent, so its reader counts events Anthropic itself
+    /// would never send: a strict reading would lose the usage or the failure they carry.
+    #[rstest]
+    #[case::a_start_short_of_every_field_but_its_usage_counts_its_input(
+        r#"{"type":"message_start","message":{"usage":{"input_tokens":7}}}"#,
+        (7, None)
+    )]
+    #[case::an_error_without_a_message_fails_the_stream(
+        r#"{"type":"error","error":{"type":"overloaded_error"}}"#,
+        (0, Some(529))
+    )]
+    fn a_messages_event_a_host_sends_short_of_a_field_is_still_read(
+        #[case] data: &str,
+        #[case] expected: (u64, Option<u16>),
+    ) {
+        let told = messages_event(Told::default(), data);
+
+        assert_eq!(
+            (told.counts.total(), told.error.map(|(status, _)| status)),
+            expected
+        );
     }
 
     #[tokio::test]
