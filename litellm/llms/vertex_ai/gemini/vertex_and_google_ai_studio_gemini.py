@@ -1648,10 +1648,14 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
 
     @staticmethod
     def _supports_minimal_thinking_level(model: str) -> bool:
-        lowered: Final = model.lower()
-        is_gemini3_or_newer_flash: Final = VertexGeminiConfig._is_gemini_3_or_newer(model) and "flash" in lowered
-        return is_gemini3_or_newer_flash and not is_explicitly_disabled_factory(
-            model=model, custom_llm_provider=None, key="supports_minimal_reasoning_effort"
+        providers: Final = ("gemini", "vertex_ai")
+        key: Final = "supports_minimal_reasoning_effort"
+        declared_by_model_map: Final = any(
+            supports_factory(model=model, custom_llm_provider=provider, key=key) for provider in providers
+        )
+        is_gemini3_or_newer_flash: Final = VertexGeminiConfig._is_gemini_3_or_newer(model) and "flash" in model.lower()
+        return (declared_by_model_map or is_gemini3_or_newer_flash) and not any(
+            is_explicitly_disabled_factory(model=model, custom_llm_provider=provider, key=key) for provider in providers
         )
 
     @staticmethod
@@ -1926,6 +1930,12 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 optional_params["include_server_side_tool_invocations"] = True
                 return
 
+    def _drops_logprobs(self, model: str, drop_params: bool, allowed_openai_params: Sequence[str]) -> bool:
+        if not drops_unsupported_params(drop_params) or {"logprobs", "top_logprobs"} & set(allowed_openai_params):
+            return False
+        rows: Final = cast(Mapping[str, Mapping[str, object]], litellm.model_cost)  # cast-ok: JSON rows by model id
+        return rows.get(f"{self._route}/{model.split('/')[-1]}", {}).get("supports_logprobs") is False
+
     def map_openai_params(
         self,
         non_default_params: dict,
@@ -1934,14 +1944,19 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         drop_params: bool,
         allow_integer_enums: bool = True,
         allow_parameters_json_schema: bool = True,
+        *,
+        allowed_openai_params: Sequence[str] = (),
     ) -> dict:
         request_params: Final = tool_params_without_hosted_mcp(
             non_default_params, model=model, route=self._route, drop_params=drop_params
         )
         self._apply_include_server_side_tool_invocations(request_params, optional_params)
         supports_sampling_params: Final = self.supports_sampling_params(model)
+        drops_logprobs: Final = self._drops_logprobs(model, drop_params, allowed_openai_params)
         for param, value in request_params.items():
             if param in ("temperature", "top_p", "top_k") and not supports_sampling_params:
+                continue
+            if param in ("logprobs", "top_logprobs") and drops_logprobs:
                 continue
             if param == "temperature":
                 if VertexGeminiConfig._is_gemini_3_or_newer(model):

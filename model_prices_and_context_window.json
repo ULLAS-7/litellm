@@ -55146,6 +55146,7 @@
             "/v1/images/edits",
             "/v1/batch"
         ],
+        "supports_logprobs": false,
         "supports_reasoning": false
     },
     "vertex_ai/gemini-3.1-flash-image-preview": {
@@ -80014,6 +80015,7 @@
             "image"
         ],
         "supports_function_calling": false,
+        "supports_minimal_reasoning_effort": true,
         "supports_pdf_input": true,
         "supports_prompt_caching": false,
         "supports_reasoning": true,
@@ -80064,6 +80066,7 @@
             "image"
         ],
         "supports_function_calling": false,
+        "supports_minimal_reasoning_effort": true,
         "supports_pdf_input": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
@@ -80111,6 +80114,8 @@
             "image"
         ],
         "supports_function_calling": false,
+        "supports_logprobs": false,
+        "supports_minimal_reasoning_effort": true,
         "supports_pdf_input": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
