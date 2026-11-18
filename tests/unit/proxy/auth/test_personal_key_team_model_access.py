@@ -37,6 +37,7 @@ from litellm.redis.stores.spend_counters import SpendCounterStore
 from litellm.router_api import RoutingContext
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.utils import get_available_models_for_user
+from tests.unit.proxy.rust_auth_stores import FakeTeamStore, RustAuthStores, install_rust_auth_stores
 
 _TEAMS: Final[Mapping[str, LiteLLM_TeamTableCachedObj]] = {
     UI_TEAM_ID: LiteLLM_TeamTableCachedObj(team_id=UI_TEAM_ID, models=[]),
@@ -633,7 +634,7 @@ def _billing_database(monkeypatch: pytest.MonkeyPatch, owner: LiteLLM_UserTable)
     for team in _TEAMS.values():
         cache.set_cache(f"team_id:{team.team_id}", team, model_type=LiteLLM_TeamTableCachedObj)
     database: Final = MagicMock()
-    database.db.litellm_teammembership.find_unique = AsyncMock(return_value=None)
+    install_rust_auth_stores(monkeypatch, RustAuthStores(team=FakeTeamStore(rows=dict(_TEAMS))))
 
     async def team_row(where: Mapping[str, object], **_: object) -> LiteLLM_TeamTableCachedObj | None:
         return _TEAMS.get(str(where["team_id"]))

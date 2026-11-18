@@ -24,6 +24,14 @@ from starlette.routing import Route
 
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.spend_counters import SpendCounterStore
+from litellm.repositories import rust_database
+from litellm.rust_bridge._native import RustTeamMembershipRepository
+from tests.unit.proxy.rust_auth_stores import (
+    FakeTeamMembershipStore,
+    FakeTeamStore,
+    RustAuthStores,
+    install_rust_auth_stores,
+)
 from tests.unit.redis.stores.spend_counters_double import FakeSpendCounters
 from fastapi import HTTPException, Request, status
 from starlette.datastructures import UploadFile
@@ -99,7 +107,7 @@ from litellm.proxy.spend_tracking.carried_budget_state import carried_budget_met
 from litellm.types.videos.utils import encode_video_id_with_provider
 from tests._master_key import MASTER_KEY
 from tests._support.rust_parallel_request_limiter import RustParallelRequestLimiter
-from tests.unit.proxy.rust_auth_stores import FakeKeyStore, RustAuthStores, install_rust_auth_stores
+from tests.unit.proxy.rust_auth_stores import FakeKeyStore
 
 
 @pytest.fixture
@@ -3644,6 +3652,7 @@ async def test_centralized_common_checks_routes_header_tags_to_litellm_metadata(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("rust_auth_stores")
 async def test_centralized_common_checks_carries_team_and_user_budget_state_on_the_token():
     """The team and user objects auth resolves are pinned on the token so the
     response path (Prometheus budget gauges) reads them from request metadata
@@ -4984,6 +4993,7 @@ async def test_member_model_budget_load_falls_back_when_override_has_no_model_ca
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("rust_auth_stores")
 async def test_member_model_budget_load_uses_default_without_membership() -> None:
     token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
     default_caps: Final = {"claude-sonnet-4-6": {"max_budget": 3.0, "budget_duration": "1d"}}
@@ -5008,6 +5018,7 @@ async def test_member_model_budget_load_uses_default_without_membership() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("rust_auth_stores")
 async def test_member_model_budget_load_fails_closed_on_default_lookup_error() -> None:
     token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
     prisma_client.db.litellm_teammembership.find_unique = AsyncMock(return_value=None)
@@ -5047,6 +5058,7 @@ async def test_member_model_budget_load_skips_default_lookup_error_when_checks_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("rust_auth_stores")
 async def test_member_model_budget_load_allows_missing_default_row() -> None:
     token, team_object, prisma_client, user_api_key_cache = _team_member_model_budget_load_inputs()
     prisma_client.db.litellm_teammembership.find_unique = AsyncMock(return_value=None)
@@ -5464,17 +5476,20 @@ async def test_keyless_team_member_vector_store_access_uses_only_the_resolved_te
             object_permission_id=where["object_permission_id"], vector_stores=grants[where["object_permission_id"]]
         )
     )
-    database.db.litellm_teammembership.find_unique = AsyncMock(return_value=None)
-    if isinstance(team_lookup, Exception):
-        database.db.litellm_teamtable.find_unique = AsyncMock(side_effect=team_lookup)
-    else:
-        database.db.litellm_teamtable.find_unique = AsyncMock(
-            side_effect=lambda where, **_: LiteLLM_TeamTable(
-                team_id=where["team_id"],
-                models=["gpt-4o-mini"],
-                object_permission_id=team_lookup[where["team_id"]],
+    install_rust_auth_stores(
+        monkeypatch,
+        RustAuthStores(
+            team=FakeTeamStore(
+                rows={
+                    team_id: team_lookup
+                    if isinstance(team_lookup, Exception)
+                    else {"team_id": team_id, "models": ["gpt-4o-mini"], "object_permission_id": team_lookup[team_id]}
+                    for team_id in ("team-1", "team-2")
+                    if isinstance(team_lookup, Exception) or team_id in team_lookup
+                }
             )
-        )
+        ),
+    )
     user_api_key_cache: Final = UserApiKeyCache()
     await user_api_key_cache.async_set_cache(
         key="user-1",
@@ -6738,6 +6753,7 @@ async def test_centralized_common_checks_backfills_org_id_from_team(key_org_id, 
         ),
     ],
 )
+@pytest.mark.usefixtures("rust_auth_stores")
 async def test_centralized_common_checks_inherits_org_identity(
     key_org_id: str | None,
     team_id: str | None,
@@ -7819,8 +7835,12 @@ async def _authenticate_session_token_against_db(
     from starlette.datastructures import URL
 
     attrs = _proxy_attrs_for_db_lookup()
-    attrs["prisma_client"].db.litellm_teammembership.find_unique = AsyncMock(return_value=membership_row)
-    attrs["prisma_client"].db.litellm_teammembership.find_first = AsyncMock(return_value=membership_row)
+    memberships: Final = FakeTeamMembershipStore(
+        rows={}
+        if membership_row is None
+        else {(membership_row.user_id, membership_row.team_id): membership_row.model_dump()}
+    )
+    other_stores: Final = rust_database.repository
     originals = {a: getattr(_proxy_server_mod, a, None) for a in attrs}
     try:
         for k, v in attrs.items():
@@ -7835,6 +7855,11 @@ async def _authenticate_session_token_against_db(
             patch(  # test-quality-ok: the builder reads its DB row loaders off module globals
                 "litellm.proxy.auth.host.python.get_team_object",
                 AsyncMock(return_value=team_row, side_effect=team_error),
+            ),
+            patch.object(
+                rust_database,
+                "repository",
+                lambda kind: memberships if kind is RustTeamMembershipRepository else other_stores(kind),
             ),
         ):
             return await user_api_key_auth_builder(
@@ -8988,7 +9013,9 @@ class TestCheckTeamMemberModelBudgetWithFallback:
         ] == _team_member_model_budget_spend_keys([primary_model])
 
     @pytest.mark.asyncio
-    async def test_fallback_settings_lookup_error_keeps_original_budget_error(self) -> None:
+    async def test_fallback_settings_lookup_error_keeps_original_budget_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         import litellm.proxy.proxy_server as proxy_server
 
         valid_token: Final = UserAPIKeyAuth(
@@ -9001,8 +9028,8 @@ class TestCheckTeamMemberModelBudgetWithFallback:
         request_data: Final = {"model": "claude-sonnet-4-6"}
         request: Final = self._request("claude-sonnet-4-6")
         await proxy_server.user_api_key_cache.async_delete_cache(key="team_id:team-1")
-        proxy_server.prisma_client.db.litellm_teamtable.find_unique = AsyncMock(
-            side_effect=RuntimeError("settings unavailable")
+        stores: Final = install_rust_auth_stores(
+            monkeypatch, RustAuthStores(team=FakeTeamStore(rows={"team-1": RuntimeError("settings unavailable")}))
         )
 
         with pytest.raises(litellm.BudgetExceededError) as exc_info:
@@ -9021,7 +9048,7 @@ class TestCheckTeamMemberModelBudgetWithFallback:
         assert [
             call.kwargs["key"] for call in redis_cache.async_get_cache.call_args_list
         ] == _team_member_model_budget_spend_keys(["claude-sonnet-4-6"])
-        proxy_server.prisma_client.db.litellm_teamtable.find_unique.assert_awaited_once()
+        assert [team_id for team_id, _ in stores.team.lookups] == ["team-1"]
 
     @pytest.mark.asyncio
     async def test_fallback_skips_candidate_after_budget_check_error(self) -> None:
